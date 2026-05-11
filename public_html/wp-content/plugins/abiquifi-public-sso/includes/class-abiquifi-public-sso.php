@@ -10,6 +10,7 @@ class Abiquifi_Public_SSO {
 	const SESSION_TTL = 604800;
 	const OPTION_SECRET = 'abiquifi_public_sso_secret';
 	const OPTION_MIGRATION = 'abiquifi_public_sso_migration_v1';
+	const OPTION_PUBLIC_AUTH_PAGES = 'abiquifi_public_sso_public_auth_pages_v1';
 	const META_SOURCE = '_abiquifi_public_sso_source';
 	const INTERNAL_SECRET_FALLBACK = 'abiquifi-public-sso-2026';
 
@@ -36,6 +37,7 @@ class Abiquifi_Public_SSO {
 
 	protected function __construct() {
 		add_action( 'init', array( $this, 'bootstrap' ), 1 );
+		add_action( 'init', array( $this, 'maybe_ensure_public_auth_pages' ), 10 );
 		add_action( 'init', array( $this, 'maybe_run_migration' ), 20 );
 		add_action( 'init', array( $this, 'register_shortcodes' ), 20 );
 		add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
@@ -44,6 +46,10 @@ class Abiquifi_Public_SSO {
 		add_action( 'admin_post_abiquifi_public_sso_login', array( $this, 'handle_dictionary_login_form' ) );
 		add_action( 'admin_post_nopriv_abiquifi_public_sso_register', array( $this, 'handle_dictionary_register_form' ) );
 		add_action( 'admin_post_abiquifi_public_sso_register', array( $this, 'handle_dictionary_register_form' ) );
+		add_action( 'admin_post_nopriv_abiquifi_public_sso_forgot_password', array( $this, 'handle_public_forgot_password_form' ) );
+		add_action( 'admin_post_abiquifi_public_sso_forgot_password', array( $this, 'handle_public_forgot_password_form' ) );
+		add_action( 'admin_post_nopriv_abiquifi_public_sso_reset_password', array( $this, 'handle_public_reset_password_form' ) );
+		add_action( 'admin_post_abiquifi_public_sso_reset_password', array( $this, 'handle_public_reset_password_form' ) );
 		add_action( 'admin_post_nopriv_abiquifi_public_sso_logout', array( $this, 'handle_public_logout' ) );
 		add_action( 'admin_post_abiquifi_public_sso_logout', array( $this, 'handle_public_logout' ) );
 		add_filter( 'the_content', array( $this, 'filter_dictionary_pages' ), 50 );
@@ -430,6 +436,88 @@ class Abiquifi_Public_SSO {
 		exit;
 	}
 
+	public function handle_public_forgot_password_form() {
+		$redirect_to = esc_url_raw( isset( $_REQUEST['redirect_to'] ) ? wp_unslash( $_REQUEST['redirect_to'] ) : $this->dictionary_home_url() );
+		if ( '' === $redirect_to ) {
+			$redirect_to = $this->dictionary_home_url();
+		}
+
+		$redirect = $this->public_forgot_password_url( $redirect_to );
+
+		if ( ! isset( $_POST['abiquifi_public_sso_forgot_password_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['abiquifi_public_sso_forgot_password_nonce'] ) ), 'abiquifi_public_sso_forgot_password' ) ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'nonce', $redirect ) );
+			exit;
+		}
+
+		$login_or_email = sanitize_text_field( isset( $_POST['user_login'] ) ? wp_unslash( $_POST['user_login'] ) : '' );
+		$user           = $this->find_user_by_login_or_email( $login_or_email );
+
+		if ( ! $user instanceof WP_User ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'not_found', $redirect ) );
+			exit;
+		}
+
+		$key = get_password_reset_key( $user );
+		if ( is_wp_error( $key ) || ! is_string( $key ) || '' === $key ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'invalid', $redirect ) );
+			exit;
+		}
+
+		$reset_url = $this->public_reset_password_url( $user->user_login, $key, $redirect_to );
+		if ( ! $this->send_public_password_reset_email( $user, $reset_url ) ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'email', $redirect ) );
+			exit;
+		}
+
+		wp_safe_redirect( add_query_arg( 'reset_sent', '1', $redirect ) );
+		exit;
+	}
+
+	public function handle_public_reset_password_form() {
+		$login       = sanitize_text_field( isset( $_POST['login'] ) ? wp_unslash( $_POST['login'] ) : '' );
+		$key         = sanitize_text_field( isset( $_POST['key'] ) ? wp_unslash( $_POST['key'] ) : '' );
+		$redirect_to = esc_url_raw( isset( $_POST['redirect_to'] ) ? wp_unslash( $_POST['redirect_to'] ) : $this->dictionary_home_url() );
+		if ( '' === $redirect_to ) {
+			$redirect_to = $this->dictionary_home_url();
+		}
+
+		$redirect = $this->public_reset_password_url( $login, $key, $redirect_to );
+
+		if ( ! isset( $_POST['abiquifi_public_sso_reset_password_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['abiquifi_public_sso_reset_password_nonce'] ) ), 'abiquifi_public_sso_reset_password' ) ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'nonce', $redirect ) );
+			exit;
+		}
+
+		$user = $this->validate_public_password_reset_key( $login, $key );
+		if ( is_wp_error( $user ) ) {
+			$state = $this->password_reset_error_state_from_code( $user->get_error_code() );
+			wp_safe_redirect( add_query_arg( 'reset_error', $state, $redirect ) );
+			exit;
+		}
+
+		$password        = isset( $_POST['pass1'] ) ? (string) wp_unslash( $_POST['pass1'] ) : '';
+		$password_repeat = isset( $_POST['pass2'] ) ? (string) wp_unslash( $_POST['pass2'] ) : '';
+
+		if ( '' === $password ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'empty', $redirect ) );
+			exit;
+		}
+
+		if ( strlen( $password ) < 8 ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'short', $redirect ) );
+			exit;
+		}
+
+		if ( $password !== $password_repeat ) {
+			wp_safe_redirect( add_query_arg( 'reset_error', 'mismatch', $redirect ) );
+			exit;
+		}
+
+		reset_password( $user, $password );
+		wp_safe_redirect( add_query_arg( 'password_reset', '1', $this->public_login_url( $redirect_to ) ) );
+		exit;
+	}
+
 	public function handle_public_logout() {
 		$redirect = esc_url_raw( isset( $_GET['redirect_to'] ) ? wp_unslash( $_GET['redirect_to'] ) : home_url( '/' ) );
 		if ( '' === $redirect ) {
@@ -458,6 +546,21 @@ class Abiquifi_Public_SSO {
 
 		$method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( (string) $_SERVER['REQUEST_METHOD'] ) : 'GET';
 
+		if ( $this->request_path_matches( 'recuperar-senha' ) ) {
+			if ( 'POST' === $method ) {
+				$this->handle_public_forgot_password_form();
+			}
+
+			$target       = $this->public_forgot_password_url();
+			$query_string = isset( $_SERVER['QUERY_STRING'] ) ? trim( (string) wp_unslash( $_SERVER['QUERY_STRING'] ) ) : '';
+			if ( '' !== $query_string ) {
+				$target .= '?' . $query_string;
+			}
+
+			wp_safe_redirect( $target );
+			exit;
+		}
+
 		if ( $this->request_path_matches( 'sair' ) ) {
 			$this->handle_public_logout();
 		}
@@ -473,6 +576,14 @@ class Abiquifi_Public_SSO {
 		if ( $this->request_path_matches( 'cadastro' ) ) {
 			$this->handle_dictionary_register_form();
 		}
+
+		if ( $this->request_path_matches( 'esqueceu-sua-senha' ) ) {
+			$this->handle_public_forgot_password_form();
+		}
+
+		if ( $this->request_path_matches( 'redefinir-senha' ) ) {
+			$this->handle_public_reset_password_form();
+		}
 	}
 
 	public function filter_dictionary_pages( $content ) {
@@ -486,6 +597,14 @@ class Abiquifi_Public_SSO {
 
 		if ( is_page( 'cadastro' ) ) {
 			return $this->render_dictionary_register_page();
+		}
+
+		if ( is_page( 'esqueceu-sua-senha' ) ) {
+			return $this->render_dictionary_forgot_password_page();
+		}
+
+		if ( is_page( 'redefinir-senha' ) ) {
+			return $this->render_dictionary_reset_password_page();
 		}
 
 		if ( is_page( 'account' ) ) {
@@ -508,7 +627,7 @@ class Abiquifi_Public_SSO {
 			return $template;
 		}
 
-		if ( is_page( 'log-in' ) || is_page( 'cadastro' ) || is_page( 'account' ) ) {
+		if ( is_page( 'log-in' ) || is_page( 'cadastro' ) || is_page( 'esqueceu-sua-senha' ) || is_page( 'redefinir-senha' ) || is_page( 'account' ) ) {
 			$plugin_template = dirname( __DIR__ ) . '/templates/public-auth-page.php';
 			if ( file_exists( $plugin_template ) ) {
 				return $plugin_template;
@@ -525,6 +644,14 @@ class Abiquifi_Public_SSO {
 
 		if ( is_page( 'cadastro' ) ) {
 			return $this->render_dictionary_register_page();
+		}
+
+		if ( is_page( 'esqueceu-sua-senha' ) ) {
+			return $this->render_dictionary_forgot_password_page();
+		}
+
+		if ( is_page( 'redefinir-senha' ) ) {
+			return $this->render_dictionary_reset_password_page();
 		}
 
 		if ( is_page( 'account' ) ) {
@@ -557,6 +684,14 @@ class Abiquifi_Public_SSO {
 
 		if ( $this->is_authority_site() && is_page( 'cadastro' ) ) {
 			$classes[] = 'abiquifi-public-view-register';
+		}
+
+		if ( $this->is_authority_site() && is_page( 'esqueceu-sua-senha' ) ) {
+			$classes[] = 'abiquifi-public-view-forgot-password';
+		}
+
+		if ( $this->is_authority_site() && is_page( 'redefinir-senha' ) ) {
+			$classes[] = 'abiquifi-public-view-reset-password';
 		}
 
 		if ( $this->is_authority_site() && is_page( 'account' ) ) {
@@ -1114,6 +1249,7 @@ class Abiquifi_Public_SSO {
 		$user        = $this->get_public_user();
 		$login_error = isset( $_GET['login_error'] ) ? sanitize_text_field( wp_unslash( $_GET['login_error'] ) ) : '';
 		$registered  = isset( $_GET['registered'] ) ? sanitize_text_field( wp_unslash( $_GET['registered'] ) ) : '';
+		$password_reset = isset( $_GET['password_reset'] ) ? sanitize_text_field( wp_unslash( $_GET['password_reset'] ) ) : '';
 		$redirect_to = isset( $_GET['redirect_to'] ) ? esc_url_raw( wp_unslash( $_GET['redirect_to'] ) ) : $this->dictionary_home_url();
 		if ( '' === $redirect_to ) {
 			$redirect_to = $this->dictionary_home_url();
@@ -1136,6 +1272,9 @@ class Abiquifi_Public_SSO {
 				<?php if ( '1' === $registered ) : ?>
 					<p class="abiquifi-public-auth__success">Cadastro concluído. Sua sessão já foi iniciada.</p>
 				<?php endif; ?>
+				<?php if ( '1' === $password_reset ) : ?>
+					<p class="abiquifi-public-auth__success">Senha redefinida com sucesso. Voce ja pode entrar com a nova senha.</p>
+				<?php endif; ?>
 				<?php if ( $login_error ) : ?>
 					<p class="abiquifi-public-auth__alert">Usuário, e-mail ou senha inválidos.</p>
 				<?php endif; ?>
@@ -1157,7 +1296,7 @@ class Abiquifi_Public_SSO {
 					<p><button type="submit" class="abiquifi-public-auth__button">Entrar</button></p>
 				</form>
 				<p class="abiquifi-public-auth__footer">Não tem conta? <a href="<?php echo esc_url( home_url( '/cadastro/' ) ); ?>">Crie sua conta &raquo;</a></p>
-				<p class="abiquifi-public-auth__footer"><a href="<?php echo esc_url( wp_lostpassword_url( home_url( '/log-in/' ) ) ); ?>">Esqueceu sua senha?</a></p>
+				<p class="abiquifi-public-auth__footer"><a href="<?php echo esc_url( $this->public_forgot_password_url( $redirect_to ) ); ?>">Esqueceu sua senha?</a></p>
 			<?php endif; ?>
 				</div>
 			</div>
@@ -1314,7 +1453,133 @@ class Abiquifi_Public_SSO {
 						<a href="<?php echo esc_url( $login_url ); ?>">Entrar</a>
 					</div>
 				</form>
-				<p class="abiquifi-public-auth__footer"><a href="<?php echo esc_url( wp_lostpassword_url( $login_url ) ); ?>">Esqueceu sua senha?</a></p>
+				<p class="abiquifi-public-auth__footer"><a href="<?php echo esc_url( $this->public_forgot_password_url( $redirect_to ) ); ?>">Esqueceu sua senha?</a></p>
+			<?php endif; ?>
+				</div>
+			</div>
+		</div>
+		<?php
+
+		return (string) ob_get_clean();
+	}
+
+	protected function render_dictionary_forgot_password_page() {
+		$user          = $this->get_public_user();
+		$reset_error   = isset( $_GET['reset_error'] ) ? sanitize_text_field( wp_unslash( $_GET['reset_error'] ) ) : '';
+		$reset_sent    = isset( $_GET['reset_sent'] ) ? sanitize_text_field( wp_unslash( $_GET['reset_sent'] ) ) : '';
+		$redirect_to   = isset( $_GET['redirect_to'] ) ? esc_url_raw( wp_unslash( $_GET['redirect_to'] ) ) : $this->dictionary_home_url();
+		$login_url     = $this->public_login_url( $redirect_to );
+
+		if ( '' === $redirect_to ) {
+			$redirect_to = $this->dictionary_home_url();
+			$login_url   = $this->public_login_url( $redirect_to );
+		}
+
+		ob_start();
+		?>
+		<div class="abiquifi-public-auth abiquifi-public-auth--forgot-password">
+			<div class="abiquifi-public-auth__shell abiquifi-public-auth__shell--wide">
+				<div class="abiquifi-public-auth__card">
+			<?php if ( $user ) : ?>
+					<p>Voce ja esta autenticado como <strong><?php echo esc_html( $user['display_name'] ); ?></strong>.</p>
+					<div class="abiquifi-public-auth__actions">
+						<a href="<?php echo esc_url( $this->dictionary_home_url() ); ?>">Ir para o dicionario</a>
+						<a href="<?php echo esc_url( $this->public_logout_url( $this->dictionary_home_url() ) ); ?>">Sair</a>
+					</div>
+			<?php else : ?>
+				<h1>Esqueceu sua senha?</h1>
+				<p>Informe seu e-mail ou nome de usuario para receber o link de redefinicao de senha.</p>
+				<?php if ( '1' === $reset_sent ) : ?>
+					<p class="abiquifi-public-auth__success">Enviamos um e-mail com o link para redefinir a senha.</p>
+				<?php endif; ?>
+				<?php if ( $reset_error ) : ?>
+					<p class="abiquifi-public-auth__alert"><?php echo esc_html( $this->forgot_password_error_message( $reset_error ) ); ?></p>
+				<?php endif; ?>
+				<form action="<?php echo esc_url( $this->public_forgot_password_url( $redirect_to ) ); ?>" method="post" class="abiquifi-public-auth__form">
+					<input type="hidden" name="action" value="abiquifi_public_sso_forgot_password" />
+					<input type="hidden" name="redirect_to" value="<?php echo esc_url( $redirect_to ); ?>" />
+					<?php wp_nonce_field( 'abiquifi_public_sso_forgot_password', 'abiquifi_public_sso_forgot_password_nonce' ); ?>
+					<p>
+						<label for="abiquifi-sso-forgot-password-login">E-mail ou nome de usuario <span class="abiquifi-public-auth__req">*</span></label>
+						<input id="abiquifi-sso-forgot-password-login" name="user_login" type="text" required />
+					</p>
+					<div class="abiquifi-public-auth__actions abiquifi-public-auth__actions--inline">
+						<button type="submit" class="abiquifi-public-auth__button">Enviar link de redefinicao</button>
+						<a href="<?php echo esc_url( $login_url ); ?>">Voltar ao login</a>
+					</div>
+				</form>
+			<?php endif; ?>
+				</div>
+			</div>
+		</div>
+		<?php
+
+		return (string) ob_get_clean();
+	}
+
+	protected function render_dictionary_reset_password_page() {
+		$user        = $this->get_public_user();
+		$reset_error = isset( $_GET['reset_error'] ) ? sanitize_text_field( wp_unslash( $_GET['reset_error'] ) ) : '';
+		$redirect_to = isset( $_GET['redirect_to'] ) ? esc_url_raw( wp_unslash( $_GET['redirect_to'] ) ) : $this->dictionary_home_url();
+		$login       = isset( $_GET['login'] ) ? sanitize_text_field( wp_unslash( $_GET['login'] ) ) : '';
+		$key         = isset( $_GET['key'] ) ? sanitize_text_field( wp_unslash( $_GET['key'] ) ) : '';
+		$login_url   = $this->public_login_url( $redirect_to );
+
+		if ( '' === $redirect_to ) {
+			$redirect_to = $this->dictionary_home_url();
+			$login_url   = $this->public_login_url( $redirect_to );
+		}
+
+		$reset_user = null;
+		if ( '' !== $login && '' !== $key ) {
+			$reset_user = $this->validate_public_password_reset_key( $login, $key );
+			if ( is_wp_error( $reset_user ) && '' === $reset_error ) {
+				$reset_error = $this->password_reset_error_state_from_code( $reset_user->get_error_code() );
+			}
+		} elseif ( '' === $reset_error ) {
+			$reset_error = 'invalid_key';
+		}
+
+		ob_start();
+		?>
+		<div class="abiquifi-public-auth abiquifi-public-auth--reset-password">
+			<div class="abiquifi-public-auth__shell abiquifi-public-auth__shell--wide">
+				<div class="abiquifi-public-auth__card">
+			<?php if ( $user && ! ( $reset_user instanceof WP_User ) ) : ?>
+					<p>Voce ja esta autenticado como <strong><?php echo esc_html( $user['display_name'] ); ?></strong>.</p>
+					<div class="abiquifi-public-auth__actions">
+						<a href="<?php echo esc_url( $this->dictionary_home_url() ); ?>">Ir para o dicionario</a>
+						<a href="<?php echo esc_url( $this->public_logout_url( $this->dictionary_home_url() ) ); ?>">Sair</a>
+					</div>
+			<?php else : ?>
+				<h1>Redefinir senha</h1>
+				<?php if ( $reset_error ) : ?>
+					<p class="abiquifi-public-auth__alert"><?php echo esc_html( $this->reset_password_error_message( $reset_error ) ); ?></p>
+				<?php endif; ?>
+				<?php if ( $reset_user instanceof WP_User ) : ?>
+					<p>Defina sua nova senha para a conta <strong><?php echo esc_html( $reset_user->user_email ); ?></strong>.</p>
+					<form action="<?php echo esc_url( $this->public_reset_password_url( $login, $key, $redirect_to ) ); ?>" method="post" class="abiquifi-public-auth__form">
+						<input type="hidden" name="action" value="abiquifi_public_sso_reset_password" />
+						<input type="hidden" name="login" value="<?php echo esc_attr( $login ); ?>" />
+						<input type="hidden" name="key" value="<?php echo esc_attr( $key ); ?>" />
+						<input type="hidden" name="redirect_to" value="<?php echo esc_url( $redirect_to ); ?>" />
+						<?php wp_nonce_field( 'abiquifi_public_sso_reset_password', 'abiquifi_public_sso_reset_password_nonce' ); ?>
+						<p>
+							<label for="abiquifi-sso-reset-password-1">Nova senha <span class="abiquifi-public-auth__req">*</span></label>
+							<input id="abiquifi-sso-reset-password-1" name="pass1" type="password" minlength="8" required />
+						</p>
+						<p>
+							<label for="abiquifi-sso-reset-password-2">Confirmar nova senha <span class="abiquifi-public-auth__req">*</span></label>
+							<input id="abiquifi-sso-reset-password-2" name="pass2" type="password" minlength="8" required />
+						</p>
+						<div class="abiquifi-public-auth__actions abiquifi-public-auth__actions--inline">
+							<button type="submit" class="abiquifi-public-auth__button">Salvar nova senha</button>
+							<a href="<?php echo esc_url( $login_url ); ?>">Voltar ao login</a>
+						</div>
+					</form>
+				<?php else : ?>
+					<p><a href="<?php echo esc_url( $this->public_forgot_password_url( $redirect_to ) ); ?>">Solicitar um novo link</a></p>
+				<?php endif; ?>
 			<?php endif; ?>
 				</div>
 			</div>
@@ -1358,6 +1623,54 @@ class Abiquifi_Public_SSO {
 		}
 
 		return 'Não foi possível criar a conta.';
+	}
+
+	protected function forgot_password_error_message( $state ) {
+		if ( 'required' === $state ) {
+			return 'Informe seu e-mail ou nome de usuario.';
+		}
+
+		if ( 'not_found' === $state ) {
+			return 'Nao foi encontrada uma conta com esse e-mail ou nome de usuario.';
+		}
+
+		if ( 'email' === $state ) {
+			return 'Nao foi possivel enviar o e-mail de redefinicao agora.';
+		}
+
+		if ( 'nonce' === $state ) {
+			return 'Sua solicitacao expirou. Tente novamente.';
+		}
+
+		if ( 'invalid' === $state ) {
+			return 'Nao foi possivel iniciar a redefinicao de senha.';
+		}
+
+		return 'Nao foi possivel processar sua solicitacao.';
+	}
+
+	protected function reset_password_error_message( $state ) {
+		if ( 'invalid_key' === $state || 'expired_key' === $state ) {
+			return 'O link de redefinicao e invalido ou expirou.';
+		}
+
+		if ( 'empty' === $state ) {
+			return 'Informe a nova senha.';
+		}
+
+		if ( 'short' === $state ) {
+			return 'A senha precisa ter pelo menos 8 caracteres.';
+		}
+
+		if ( 'mismatch' === $state ) {
+			return 'A confirmacao da senha nao confere.';
+		}
+
+		if ( 'nonce' === $state ) {
+			return 'Sua solicitacao expirou. Tente novamente.';
+		}
+
+		return 'Nao foi possivel redefinir a senha.';
 	}
 
 	protected function dictionary_home_url() {
@@ -1477,6 +1790,79 @@ class Abiquifi_Public_SSO {
 		return $length >= 10 && $length <= 13;
 	}
 
+	protected function find_user_by_login_or_email( $login_or_email ) {
+		$login_or_email = trim( (string) $login_or_email );
+		if ( '' === $login_or_email ) {
+			return null;
+		}
+
+		$user = null;
+		if ( is_email( $login_or_email ) ) {
+			$user = get_user_by( 'email', $login_or_email );
+		}
+
+		if ( ! $user ) {
+			$user = get_user_by( 'login', $login_or_email );
+		}
+
+		return $user instanceof WP_User ? $user : null;
+	}
+
+	protected function validate_public_password_reset_key( $login, $key ) {
+		$login = trim( (string) $login );
+		$key   = trim( (string) $key );
+
+		if ( '' === $login || '' === $key ) {
+			return new WP_Error( 'invalid_key', 'Link invalido.', array( 'status' => 400 ) );
+		}
+
+		return check_password_reset_key( $key, $login );
+	}
+
+	protected function password_reset_error_state_from_code( $code ) {
+		if ( 'expired_key' === $code ) {
+			return 'expired_key';
+		}
+
+		return 'invalid_key';
+	}
+
+	protected function send_public_password_reset_email( $user, $reset_url ) {
+		if ( ! $user instanceof WP_User || ! $user->exists() ) {
+			return false;
+		}
+
+		$to = sanitize_email( (string) $user->user_email );
+		if ( '' === $to || ! is_email( $to ) ) {
+			return false;
+		}
+
+		$name     = $user->display_name ? $user->display_name : $user->user_login;
+		$subject  = 'Redefinicao de senha | Dicionario';
+		$headers  = array(
+			'Content-Type: text/html; charset=UTF-8',
+			'From: ' . $this->mail_from_name() . ' <' . $this->mail_from_email() . '>',
+		);
+		$message  = sprintf(
+			'<html><body style="margin:0;padding:0;background:#f4f7fb;font-family:Arial,sans-serif;color:#162b40;">' .
+			'<div style="max-width:640px;margin:0 auto;padding:32px 20px;">' .
+			'<div style="background:#ffffff;border-radius:16px;padding:32px;border:1px solid #d9e2ec;">' .
+			'<p style="margin:0 0 16px;font-size:14px;letter-spacing:.08em;text-transform:uppercase;color:#6c8195;">Abiquifi</p>' .
+			'<h1 style="margin:0 0 20px;font-size:28px;line-height:1.2;color:#0d2236;">Redefinicao de senha</h1>' .
+			'<p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Ola %1$s, recebemos uma solicitacao para redefinir a senha da sua conta.</p>' .
+			'<p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Use o botao abaixo para criar uma nova senha.</p>' .
+			'<p style="margin:0 0 24px;"><a href="%2$s" style="display:inline-block;background:#0d2236;color:#ffffff;text-decoration:none;padding:14px 20px;border-radius:999px;font-weight:700;">Redefinir senha</a></p>' .
+			'<p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#6c8195;">Se voce nao solicitou esta redefinicao, ignore esta mensagem.</p>' .
+			'<p style="margin:0;font-size:13px;line-height:1.6;color:#6c8195;">Mensagem automatica enviada por %3$s.</p>' .
+			'</div></div></body></html>',
+			esc_html( $name ),
+			esc_url( $reset_url ),
+			esc_html( $this->mail_from_name() )
+		);
+
+		return (bool) wp_mail( $to, $subject, $message, $headers );
+	}
+
 	protected function authenticate_credentials( $login, $password, $remember ) {
 		$login = trim( (string) $login );
 
@@ -1484,14 +1870,7 @@ class Abiquifi_Public_SSO {
 			return new WP_Error( 'abiquifi_sso_required', 'Informe e-mail e senha.', array( 'status' => 400 ) );
 		}
 
-		$user = false;
-		if ( is_email( $login ) ) {
-			$user = get_user_by( 'email', $login );
-		}
-
-		if ( ! $user ) {
-			$user = get_user_by( 'login', $login );
-		}
+		$user = $this->find_user_by_login_or_email( $login );
 
 		if ( ! $user || ! wp_check_password( $password, $user->user_pass, $user->ID ) ) {
 			return new WP_Error( 'abiquifi_sso_invalid_credentials', 'Credenciais invalidas.', array( 'status' => 401 ) );
@@ -1855,6 +2234,29 @@ class Abiquifi_Public_SSO {
 		return $this->public_frontend_url( 'cadastro', $redirect_to );
 	}
 
+	public function public_forgot_password_url( $redirect_to = '' ) {
+		return $this->public_frontend_url( 'esqueceu-sua-senha', $redirect_to );
+	}
+
+	public function public_reset_password_url( $login = '', $key = '', $redirect_to = '' ) {
+		$url = $this->public_frontend_url( 'redefinir-senha', $redirect_to );
+
+		$args = array();
+		if ( '' !== $login ) {
+			$args['login'] = $login;
+		}
+
+		if ( '' !== $key ) {
+			$args['key'] = $key;
+		}
+
+		if ( ! empty( $args ) ) {
+			$url = add_query_arg( $args, $url );
+		}
+
+		return $url;
+	}
+
 	public function remote_login( $login, $password, $remember ) {
 		return $this->request_authority(
 			'/login',
@@ -1947,6 +2349,23 @@ class Abiquifi_Public_SSO {
 		return $data;
 	}
 
+	public function maybe_ensure_public_auth_pages() {
+		if ( ! $this->is_authority_site() ) {
+			return;
+		}
+
+		if ( get_option( self::OPTION_PUBLIC_AUTH_PAGES ) ) {
+			return;
+		}
+
+		$forgot_page = $this->ensure_public_auth_page( 'esqueceu-sua-senha', 'Esqueceu sua senha?' );
+		$reset_page  = $this->ensure_public_auth_page( 'redefinir-senha', 'Redefinir senha' );
+
+		if ( $forgot_page > 0 && $reset_page > 0 ) {
+			update_option( self::OPTION_PUBLIC_AUTH_PAGES, current_time( 'mysql' ), false );
+		}
+	}
+
 	public function maybe_run_migration() {
 		if ( ! $this->is_fabricamos_site() ) {
 			return;
@@ -1959,6 +2378,26 @@ class Abiquifi_Public_SSO {
 		$this->push_local_public_users_to_authority();
 		$this->pull_authority_public_users_to_local();
 		update_option( self::OPTION_MIGRATION, current_time( 'mysql' ), false );
+	}
+
+	protected function ensure_public_auth_page( $slug, $title ) {
+		$page = get_page_by_path( $slug, OBJECT, 'page' );
+		if ( $page instanceof WP_Post ) {
+			return (int) $page->ID;
+		}
+
+		$page_id = wp_insert_post(
+			array(
+				'post_title'   => $title,
+				'post_name'    => $slug,
+				'post_type'    => 'page',
+				'post_status'  => 'publish',
+				'post_content' => '',
+			),
+			true
+		);
+
+		return is_wp_error( $page_id ) ? 0 : (int) $page_id;
 	}
 
 	protected function push_local_public_users_to_authority() {
