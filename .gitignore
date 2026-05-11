@@ -1,0 +1,62 @@
+# WordPress core e arquivos sensíveis
+wp-config.php
+public_html/wp-config.php
+.htaccess
+public_html/.htaccess
+web.config
+public_html/web.config
+
+# Uploads e mídias
+wp-content/uploads/
+public_html/wp-content/uploads/
+
+wp-content/aiowps_backups/
+public_html/wp-content/aiowps_backups/
+
+wp-content/backup*/
+public_html/wp-content/backup*/
+
+wp-content/backups/
+public_html/wp-content/backups/
+
+wp-content/cache/
+public_html/wp-content/cache/
+
+wp-content/litespeed/
+public_html/wp-content/litespeed/
+
+wp-content/upgrade/
+public_html/wp-content/upgrade/
+
+# Arquivos temporários
+wp-content/temp-write-test*/
+public_html/wp-content/temp-write-test*/
+
+# Logs
+*.log
+debug.log
+error_log
+
+# Banco, dumps e backups
+*.sql
+*.sql.gz
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+*.bak
+*.backup
+*.backup*
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Dependências, caso existam
+node_modules/
+vendor/
