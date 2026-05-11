@@ -201,6 +201,16 @@ class Abiquifi_Public_SSO {
 
 		register_rest_route(
 			'abiquifi-sso/v1',
+			'/reset-password',
+			array(
+				'methods'             => WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'rest_reset_password' ),
+				'permission_callback' => '__return_true',
+			)
+		);
+
+		register_rest_route(
+			'abiquifi-sso/v1',
 			'/logout',
 			array(
 				'methods'             => WP_REST_Server::CREATABLE,
@@ -274,6 +284,43 @@ class Abiquifi_Public_SSO {
 		}
 
 		return rest_ensure_response( $result );
+	}
+
+	public function rest_reset_password( WP_REST_Request $request ) {
+		if ( ! $this->is_authority_site() ) {
+			return new WP_Error( 'abiquifi_sso_not_authority', 'Este endpoint so pode ser executado no dicionario.', array( 'status' => 403 ) );
+		}
+
+		$secret         = sanitize_text_field( (string) $request->get_param( 'secret' ) );
+		$login_or_email = sanitize_text_field( (string) $request->get_param( 'login' ) );
+		$password       = (string) $request->get_param( 'password' );
+
+		if ( ! $this->is_internal_secret_valid( $secret ) ) {
+			return new WP_Error( 'abiquifi_sso_forbidden', 'Segredo invalido.', array( 'status' => 403 ) );
+		}
+
+		if ( '' === $login_or_email || '' === $password ) {
+			return new WP_Error( 'abiquifi_sso_required', 'Login e senha sao obrigatorios.', array( 'status' => 400 ) );
+		}
+
+		if ( strlen( $password ) < 8 ) {
+			return new WP_Error( 'abiquifi_sso_password_short', 'A senha precisa ter pelo menos 8 caracteres.', array( 'status' => 400 ) );
+		}
+
+		$user = $this->find_user_by_login_or_email( $login_or_email );
+		if ( ! $user instanceof WP_User ) {
+			return new WP_Error( 'abiquifi_sso_invalid_user', 'Usuario invalido.', array( 'status' => 404 ) );
+		}
+
+		reset_password( $user, $password );
+		$user = get_user_by( 'id', (int) $user->ID );
+
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'user'    => $user instanceof WP_User ? $this->normalize_user( $user ) : array(),
+			)
+		);
 	}
 
 	public function rest_logout( WP_REST_Request $request ) {
@@ -2284,6 +2331,20 @@ class Abiquifi_Public_SSO {
 						'password_repeat' => $password_repeat,
 					),
 					(array) $profile
+				),
+			)
+		);
+	}
+
+	public function remote_reset_password( $login_or_email, $password ) {
+		return $this->request_authority(
+			'/reset-password',
+			array(
+				'method' => 'POST',
+				'body'   => array(
+					'secret'   => $this->internal_secret(),
+					'login'    => $login_or_email,
+					'password' => $password,
 				),
 			)
 		);
